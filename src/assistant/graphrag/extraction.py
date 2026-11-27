@@ -151,7 +151,8 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         {"role": "user", "content": f"Коды: {', '.join(sorted(codes)) or 'нет'}\nФрагмент:\n{chunk.text}"},
     ]
     result = ExtractionResult(chunk.chunk_id, chunk.doc_id)
-    has_structured_rows = INSTALLATION_LIST.search(chunk.text) or PANEL_ERROR.search(chunk.text)
+    installation = INSTALLATION_LIST.search(chunk.text)
+    has_structured_rows = installation or PANEL_ERROR.search(chunk.text)
     max_tokens = 2048
     if has_structured_rows:
         max_tokens = 1024
@@ -161,6 +162,12 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
             "Связи HAS_PART, IS_A, SUPPLIED_BY и INDICATES из самих списков в relations не повторяй. "
             "Связи вне списков, например принадлежность модели к линейке, извлеки по общей схеме."
         )
+    if installation:
+        narrative = INSTALLATION_LIST.sub(
+            lambda match: f"В {match['model']} установлены детали, перечисленные среди кодов.\n",
+            chunk.text,
+        )
+        messages[1]["content"] = f"Коды: {', '.join(sorted(codes))}\nФрагмент:\n{narrative}"
 
     for attempt in range(2):
         response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=max_tokens)
