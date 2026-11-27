@@ -3,6 +3,7 @@
 import json
 import re
 from collections.abc import Callable
+from decimal import Decimal
 
 from assistant.agent.tools import ERP_NOT_FOUND, TOOL_SCHEMAS, validate_arguments
 from assistant.graphrag.search import NO_DATA
@@ -13,13 +14,15 @@ from assistant.infra.schemas import AgentResult, ToolStep
 
 ORDER = "create_service_order"
 ERP_UNAVAILABLE = "Данные ERP получить не удалось."
-NUMBER = r"(?<![\w-])(?<!\d[.,])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w-]|[.,]\d)"
-PRICE = r"(?:руб\w*|₽)"
+INTEGER = r"(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)"
+NUMBER = rf"(?<![\w−-])(?<!\d[.,]){INTEGER}(?![\w-]|[.,]\d)"
+AMOUNT = rf"(?<![\w−-])(?<!\d[.,])[+−-]?{INTEGER}(?:[.,]\d+)?(?![\w-]|[.,]\d)"
+PRICE = r"(?:руб\w*|₽|RUB)"
 UNITS = r"(?:шт\.?|штук\w*|ед\.?|единиц\w*|экземпляр\w*)"
-PRICE_SUFFIX = re.compile(rf"({NUMBER})\s*{PRICE}(?!\w)", re.IGNORECASE)
-PRICE_PREFIX = re.compile(rf"(?:цена|стоимост[ьи]|стоит)\s*[:–—=]?\s*({NUMBER})", re.IGNORECASE)
-STOCK_SUFFIX = re.compile(rf"({NUMBER})\s*{UNITS}(?!\w)", re.IGNORECASE)
-STOCK_PREFIX = re.compile(rf"(?:остаток|в наличии|на складе)\s*[:–—=]?\s*({NUMBER})", re.IGNORECASE)
+PRICE_SUFFIX = re.compile(rf"({AMOUNT})\s*{PRICE}(?!\w)", re.IGNORECASE)
+PRICE_PREFIX = re.compile(rf"(?:\b(?:цена|стоимост[ьи]|стоит)\s*[:–—=]?|₽)\s*({AMOUNT})", re.IGNORECASE)
+STOCK_SUFFIX = re.compile(rf"({AMOUNT})\s*{UNITS}(?!\w)", re.IGNORECASE)
+STOCK_PREFIX = re.compile(rf"\b(?:остаток|в наличии|на складе)\s*[:–—=]?\s*({AMOUNT})", re.IGNORECASE)
 ORDER_ID = re.compile(r"(?<![\w-])SO-\d+(?![\w-])", re.IGNORECASE)
 ORDER_NUMBERS = {
     "одну": 1,
@@ -61,8 +64,12 @@ def _numeric_value(text: str) -> int:
     return int(re.sub(r"\s", "", text))
 
 
-def _numbers(text: str, *patterns: re.Pattern) -> set[int]:
-    return {_numeric_value(match) for pattern in patterns for match in pattern.findall(text)}
+def _numbers(text: str, *patterns: re.Pattern) -> set[Decimal]:
+    return {
+        Decimal(re.sub(r"\s", "", match).replace(",", ".").replace("−", "-"))
+        for pattern in patterns
+        for match in pattern.findall(text)
+    }
 
 
 def _order_quantities(question: str) -> set[int]:
