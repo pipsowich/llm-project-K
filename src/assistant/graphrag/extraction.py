@@ -29,7 +29,11 @@ RELATION_MEANINGS = {
 }
 
 EXAMPLE = {
-    "entities": [{"type": "Part", "name": code} for code in ("P-1042", "P-1042B")],
+    "entities": [
+        {"type": "Part", "name": "P-1042"},
+        {"type": "Part", "name": "P-1042B"},
+        {"type": "Component", "name": "пусковое реле"},
+    ],
     "relations": [
         {
             "subject_type": "Part",
@@ -37,7 +41,14 @@ EXAMPLE = {
             "type": "REPLACED_BY",
             "object_type": "Part",
             "object": "P-1042B",
-        }
+        },
+        {
+            "subject_type": "Part",
+            "subject": "P-1042",
+            "type": "IS_A",
+            "object_type": "Component",
+            "object": "пусковое реле",
+        },
     ],
 }
 
@@ -76,17 +87,19 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
                 f"Типы сущностей: {', '.join(ENTITY_TYPES)}.\n"
                 f"Допустимые названия: {json.dumps(names, ensure_ascii=False)}.\n"
                 f"Связи направлены от subject к object:\n{directions}\n"
-                "Верни JSON с массивами entities и relations. Если фактов нет, верни пустые массивы.\n"
-                "Пример для текста «Деталь P-1042 снята с производства и заменена на P-1042B»: "
-                + json.dumps(EXAMPLE, ensure_ascii=False)
+                "Коды в сущностях и связях копируй точно из списка кодов для фрагмента. "
+                "Верни компактный JSON с массивами entities и relations. "
+                "Если фактов нет, верни пустые массивы.\n"
+                "Пример для текста «Деталь P-1042 (пусковое реле) заменена на P-1042B»: "
+                + json.dumps(EXAMPLE, ensure_ascii=False, separators=(",", ":"))
             ),
         },
-        {"role": "user", "content": chunk.text},
+        {"role": "user", "content": f"Коды: {', '.join(sorted(codes)) or 'нет'}\nФрагмент:\n{chunk.text}"},
     ]
     result = ExtractionResult(chunk.chunk_id, chunk.doc_id)
 
     for attempt in range(2):
-        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA)
+        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=2048)
         try:
             facts = ExtractedFacts.model_validate_json(response.content, strict=True)
         except ValidationError:
