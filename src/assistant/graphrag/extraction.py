@@ -1,6 +1,8 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
 import json
+import re
+from collections.abc import Iterator
 
 from pydantic import BaseModel, ValidationError
 
@@ -27,6 +29,17 @@ RELATION_MEANINGS = {
     "SUPPLIED_BY": "поставщик поставляет деталь",
     "FAILED": "отчёт о ремонте фиксирует отказ узла у модели",
 }
+
+INSTALLATION_LIST = re.compile(
+    r"^В (?P<model>\S+) установлены следующие узлы\.[ \t]*\n[ \t\n]*(?P<items>(?:[ \t]*-[^\n]+\n?)+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+INSTALLED_PART = re.compile(r"^[ \t]*-[^\n]+?[–—][ \t]*деталь[ \t]+([^,\s]+)", re.IGNORECASE | re.MULTILINE)
+EXPLICIT_REPLACEMENT = re.compile(
+    r"\bдеталь\s+(?P<old>\S+)\s+(?:\([^\n]+\)\s+)?снята с производства\.\s+"
+    r"вместо не[её] устанавливается деталь\s+(?P<new>[^\s.,;]+)",
+    re.IGNORECASE,
+)
 
 EXAMPLE = {
     "entities": [
@@ -69,6 +82,25 @@ class ExtractedRelation(BaseModel):
 class ExtractedFacts(BaseModel):
     entities: list[ExtractedEntity]
     relations: list[ExtractedRelation]
+
+
+def _document_relations(text: str, entities: set[Entity]) -> Iterator[Relation]:
+    """Восстанавливает связи найденных деталей из явных списков и формулировок."""
+    parts = {entity.name: entity for entity in entities if entity.type == "Part"}
+    for scope in INSTALLATION_LIST.finditer(text):
+        model = canonical_name("Model", scope["model"], {})
+        if model is None:
+            continue
+        for raw_part in INSTALLED_PART.findall(scope["items"]):
+            part = parts.get(canonical_name("Part", raw_part, {}))
+            if part is not None:
+                yield Relation(Entity("Model", model), "HAS_PART", part)
+
+    for statement in EXPLICIT_REPLACEMENT.finditer(text):
+        old = parts.get(canonical_name("Part", statement["old"], {}))
+        new = parts.get(canonical_name("Part", statement["new"], {}))
+        if old is not None and new is not None and old != new:
+            yield Relation(old, "REPLACED_BY", new)
 
 
 def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
@@ -121,6 +153,17 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
 
     entities = set()
     relations = set()
+
+    def keep_relation(relation: Relation) -> None:
+        if relation in relations:
+            return
+        relations.add(relation)
+        result.relations.append(relation)
+        for entity in (relation.subject, relation.object):
+            if entity not in entities:
+                entities.add(entity)
+                result.entities.append(entity)
+
     for raw in facts.entities:
         entity = grounded_entity(raw.type, raw.name)
         if entity is None:
@@ -138,12 +181,9 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         relation = Relation(subject, raw.type, target)
         if not relation.matches_schema():
             result.dropped += 1
-        elif relation not in relations:
-            relations.add(relation)
-            result.relations.append(relation)
-            for entity in (subject, target):
-                if entity not in entities:
-                    entities.add(entity)
-                    result.entities.append(entity)
+        else:
+            keep_relation(relation)
 
+    for relation in _document_relations(chunk.text, entities):
+        keep_relation(relation)
     return result
