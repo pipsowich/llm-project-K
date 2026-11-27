@@ -34,7 +34,15 @@ INSTALLATION_LIST = re.compile(
     r"^В (?P<model>\S+) установлены следующие узлы\.[ \t]*\n[ \t\n]*(?P<items>(?:[ \t]*-[^\n]+\n?)+)",
     re.IGNORECASE | re.MULTILINE,
 )
-INSTALLED_PART = re.compile(r"^[ \t]*-[^\n]+?[–—][ \t]*деталь[ \t]+([^,\s]+)", re.IGNORECASE | re.MULTILINE)
+INSTALLED_PART = re.compile(
+    r"^[ \t]*-[ \t]*(?P<component>[^\n]+?)[–—][ \t]*деталь[ \t]+(?P<part>[^,\s]+)"
+    r"(?:,[ \t]*поставщик[ \t]*«(?P<supplier>[^»\n]+)»)?",
+    re.IGNORECASE | re.MULTILINE,
+)
+PANEL_ERROR = re.compile(
+    r"^[ \t]*-[ \t]*(?P<error>\S+)[ \t]*[–—][^\n]+?,[ \t]*отказ узла[ \t]*«(?P<component>[^»\n]+)»",
+    re.IGNORECASE | re.MULTILINE,
+)
 EXPLICIT_REPLACEMENT = re.compile(
     r"\bдеталь\s+(?P<old>\S+)\s+(?:\([^\n]+\)\s+)?снята с производства\.\s+"
     r"вместо не[её] устанавливается деталь\s+(?P<new>[^\s.,;]+)",
@@ -84,17 +92,31 @@ class ExtractedFacts(BaseModel):
     relations: list[ExtractedRelation]
 
 
-def _document_relations(text: str, entities: set[Entity]) -> Iterator[Relation]:
-    """Восстанавливает связи найденных деталей из явных списков и формулировок."""
+def _document_relations(text: str, entities: set[Entity], names: dict[str, list[str]]) -> Iterator[Relation]:
+    """Связывает найденные коды по явным строкам руководств и бюллетеней."""
     parts = {entity.name: entity for entity in entities if entity.type == "Part"}
+    errors = {entity.name: entity for entity in entities if entity.type == "ErrorCode"}
     for scope in INSTALLATION_LIST.finditer(text):
         model = canonical_name("Model", scope["model"], {})
         if model is None:
             continue
-        for raw_part in INSTALLED_PART.findall(scope["items"]):
-            part = parts.get(canonical_name("Part", raw_part, {}))
-            if part is not None:
-                yield Relation(Entity("Model", model), "HAS_PART", part)
+        for row in INSTALLED_PART.finditer(scope["items"]):
+            part = parts.get(canonical_name("Part", row["part"], {}))
+            if part is None:
+                continue
+            yield Relation(Entity("Model", model), "HAS_PART", part)
+            component = canonical_name("Component", row["component"], names)
+            supplier = canonical_name("Supplier", row["supplier"] or "", names)
+            if component is not None:
+                yield Relation(part, "IS_A", Entity("Component", component))
+            if supplier is not None:
+                yield Relation(part, "SUPPLIED_BY", Entity("Supplier", supplier))
+
+    for row in PANEL_ERROR.finditer(text):
+        error = errors.get(canonical_name("ErrorCode", row["error"], {}))
+        component = canonical_name("Component", row["component"], names)
+        if error is not None and component is not None:
+            yield Relation(error, "INDICATES", Entity("Component", component))
 
     for statement in EXPLICIT_REPLACEMENT.finditer(text):
         old = parts.get(canonical_name("Part", statement["old"], {}))
@@ -129,9 +151,19 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         {"role": "user", "content": f"Коды: {', '.join(sorted(codes)) or 'нет'}\nФрагмент:\n{chunk.text}"},
     ]
     result = ExtractionResult(chunk.chunk_id, chunk.doc_id)
+    has_structured_rows = INSTALLATION_LIST.search(chunk.text) or PANEL_ERROR.search(chunk.text)
+    max_tokens = 2048
+    if has_structured_rows:
+        max_tokens = 1024
+        messages[0]["content"] += (
+            "\nСтроки списка установленных узлов или списка кодов ошибок обрабатываются отдельно. "
+            "Из этих строк перечисли все сущности, особенно коды деталей и ошибок. "
+            "Связи HAS_PART, IS_A, SUPPLIED_BY и INDICATES из самих списков в relations не повторяй. "
+            "Связи вне списков, например принадлежность модели к линейке, извлеки по общей схеме."
+        )
 
     for attempt in range(2):
-        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=2048)
+        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=max_tokens)
         try:
             facts = ExtractedFacts.model_validate_json(response.content, strict=True)
         except ValidationError:
@@ -184,6 +216,6 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         else:
             keep_relation(relation)
 
-    for relation in _document_relations(chunk.text, entities):
+    for relation in _document_relations(chunk.text, entities, names):
         keep_relation(relation)
     return result
